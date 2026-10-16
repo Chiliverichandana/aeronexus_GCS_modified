@@ -50,7 +50,7 @@ public class FlightCommandController {
             @Valid @RequestBody FlightCommandRequest request,
             @AuthenticationPrincipal UserDetails userDetails) {
         FlightCommandResponse response = commandService.executeOverrideCommand(request, userDetails.getUsername());
-        return ResponseEntity.ok(ApiResponse.success("Override command executed successfully", response));
+        return ResponseEntity.ok(ApiResponse.success("Override command accepted for dispatch", response));
     }
 
     @GetMapping("/history")

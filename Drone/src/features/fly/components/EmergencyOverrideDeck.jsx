@@ -214,6 +214,12 @@ export const EmergencyOverrideDeck = () => {
             return
           }
 
+          const initialAltitude =
+            telemetry?.metadata?.source === "pymavlink" &&
+            Number.isFinite(telemetry.altitude)
+              ? telemetry.altitude
+              : null
+
           const cmdMap = {
             OVERRIDE_RTL: "OVERRIDE_RTL",
             RTL: "OVERRIDE_RTL",
@@ -231,6 +237,38 @@ export const EmergencyOverrideDeck = () => {
               timestamp: new Date().toISOString(),
             }),
           })
+
+          const landingState = isLand
+            ? await flightControlService.waitForLandingProgress({
+                droneId,
+                initialAltitude,
+              })
+            : null
+
+          if (isLand) {
+            const landingMessage =
+              landingState.altitude <= 0.5
+                ? `${droneId} is in LAND mode near ground level (${landingState.altitude.toFixed(1)} m).`
+                : `${droneId} is in LAND mode and descending (${landingState.altitude.toFixed(1)} m).`
+            showAlert({
+              type: AlertTypes.SUCCESS,
+              title: "LANDING CONFIRMED",
+              message: landingMessage,
+              key: "LAND_RESULT",
+              category: AlertCategories.FLIGHT,
+            })
+            window.dispatchEvent(
+              new CustomEvent("aeronexus:emergency-land", {
+                detail: {
+                  droneId,
+                  flightMode: landingState.flightMode,
+                  altitude: landingState.altitude,
+                  timestamp: new Date().toISOString(),
+                },
+              })
+            )
+            return
+          }
         } catch (err) {
           if (isDisarm) return
 
@@ -246,7 +284,7 @@ export const EmergencyOverrideDeck = () => {
           } else if (isLand) {
             showAlert({
               type: AlertTypes.ERROR,
-              title: "LAND FAILED",
+              title: "LANDING NOT CONFIRMED",
               message: failMsg,
               key: "LAND_RESULT",
               category: AlertCategories.FLIGHT,
@@ -264,15 +302,6 @@ export const EmergencyOverrideDeck = () => {
             category: AlertCategories.FLIGHT,
           })
           window.dispatchEvent(new CustomEvent("aeronexus:emergency-rtl"))
-        } else if (isLand) {
-          showAlert({
-            type: AlertTypes.SUCCESS,
-            title: "LAND SUCCESS",
-            message: `Landing sequence initiated for ${droneId}.`,
-            key: "LAND_RESULT",
-            category: AlertCategories.FLIGHT,
-          })
-          window.dispatchEvent(new CustomEvent("aeronexus:emergency-land"))
         }
       },
     })

@@ -97,33 +97,36 @@ public class FlightCommandService {
         }
     }
 
-        @Transactional
+    @Transactional
     public FlightCommandResponse executeOverrideCommand(FlightCommandRequest request, String managerUsername) {
-            String commandType = request.commandType().toUpperCase();
-            boolean disarmRequest = "FORCE_DISARM".equals(commandType)
-                    || "DISARM".equals(commandType);
+        String commandType = request.commandType().toUpperCase();
+        boolean disarmRequest = "FORCE_DISARM".equals(commandType)
+                || "DISARM".equals(commandType);
+        boolean landRequest = "EMERGENCY_LAND".equals(commandType)
+                || "LAND".equals(commandType);
+        boolean dispatchToBridge = disarmRequest || landRequest;
 
-            FlightCommand command = new FlightCommand(
+        FlightCommand command = new FlightCommand(
+                request.droneId(),
+                commandType,
+                true,
+                managerUsername,
+                dispatchToBridge ? "OVERRIDE_PENDING" : "OVERRIDE_EXECUTED",
+                request.getEffectivePayloadJson()
+        );
+        FlightCommand saved = commandRepository.save(command);
+
+        if (dispatchToBridge) {
+            droneCommandWebSocketService.sendCommand(
                     request.droneId(),
-                    commandType,
-                    true,
-                    managerUsername,
-                    disarmRequest ? "OVERRIDE_PENDING" : "OVERRIDE_EXECUTED",
-                    request.getEffectivePayloadJson()
+                    String.valueOf(saved.getId()),
+                    disarmRequest ? "DISARM" : "LAND",
+                    parseParameters(request.getEffectivePayloadJson())
             );
-            FlightCommand saved = commandRepository.save(command);
-
-            if (disarmRequest) {
-                droneCommandWebSocketService.sendCommand(
-                        request.droneId(),
-                        String.valueOf(saved.getId()),
-                        "DISARM",
-                        parseParameters(request.getEffectivePayloadJson())
-                );
-            }
-
-            return FlightCommandResponse.fromEntity(saved);
         }
+
+        return FlightCommandResponse.fromEntity(saved);
+    }
 
     @Transactional(readOnly = true)
     public List<FlightCommandResponse> getCommandHistory(String droneId) {
@@ -135,4 +138,3 @@ public class FlightCommandService {
                 .toList();
     }
 }
-

@@ -179,6 +179,113 @@ class FlightControlService {
   }
 
   /**
+   * Wait until live MAVLink telemetry confirms the requested flight mode.
+   */
+  async waitForFlightModeConfirmation({
+    droneId = "DRONE-001",
+    expectedMode,
+    timeoutMs = 30000,
+  } = {}) {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timeoutId
+
+      const cleanup = () => {
+        clearTimeout(timeoutId)
+        unsubscribe()
+      }
+
+      const unsubscribe = telemetryClient.onTelemetry((telemetry) => {
+        if (
+          telemetry?.droneId === droneId &&
+          telemetry?.metadata?.source === "pymavlink" &&
+          typeof telemetry.flightMode === "string" &&
+          telemetry.flightMode.toUpperCase() === expectedMode.toUpperCase() &&
+          !settled
+        ) {
+          settled = true
+          cleanup()
+          resolve(true)
+        }
+      })
+
+      timeoutId = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error(`No SITL ${expectedMode} mode confirmation received for ${droneId}.`))
+      }, timeoutMs)
+    })
+  }
+
+  /**
+   * Wait for live MAVLink telemetry to confirm LAND mode and actual descent.
+   */
+  async waitForLandingProgress({
+    droneId = "DRONE-001",
+    initialAltitude = null,
+    timeoutMs = 60000,
+  } = {}) {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let startingAltitude = initialAltitude
+      let landModeConfirmed = false
+      let timeoutId
+
+      const cleanup = () => {
+        clearTimeout(timeoutId)
+        unsubscribe()
+      }
+
+      const unsubscribe = telemetryClient.onTelemetry((telemetry) => {
+        if (
+          telemetry?.droneId !== droneId ||
+          telemetry?.metadata?.source !== "pymavlink" ||
+          typeof telemetry.altitude !== "number"
+        ) {
+          return
+        }
+
+        if (startingAltitude === null) {
+          startingAltitude = telemetry.altitude
+        }
+
+        if (
+          typeof telemetry.flightMode === "string" &&
+          telemetry.flightMode.toUpperCase() === "LAND"
+        ) {
+          landModeConfirmed = true
+        }
+
+        const descentThreshold = 0.5
+        const descentConfirmed =
+          startingAltitude <= 0.5 ||
+          telemetry.altitude <= startingAltitude - descentThreshold
+
+        if (landModeConfirmed && descentConfirmed && !settled) {
+          settled = true
+          cleanup()
+          resolve({
+            flightMode: telemetry.flightMode,
+            altitude: telemetry.altitude,
+          })
+        }
+      })
+
+      timeoutId = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(
+          new Error(
+            `No SITL LAND mode and descent confirmation received for ${droneId}.`
+          )
+        )
+      }, timeoutMs)
+    })
+  }
+
+  /**
    * Await authoritative confirmation of the drone's armed state.
    * Listens for incoming telemetry or backend response execution status.
    * @param {Object} options

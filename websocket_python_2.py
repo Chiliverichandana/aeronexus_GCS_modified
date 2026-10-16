@@ -61,6 +61,8 @@ MIN_TAKEOFF_ALTITUDE = 1.0
 MAX_TAKEOFF_ALTITUDE = 20.0
 TAKEOFF_CLIMB_CONFIRMATION_METRES = 1.5
 TAKEOFF_CLIMB_TIMEOUT = 30
+LAND_DESCENT_CONFIRMATION_METRES = 0.5
+LAND_DESCENT_TIMEOUT = 60
 
 
 # ============================================================
@@ -800,18 +802,39 @@ def takeoff(altitude):
 
 def land():
     """
-    Request LAND mode and confirm the mode change.
-
-    LAND mode confirmation does not mean touchdown has occurred.
+    Request LAND mode, then verify the vehicle has begun descending.
     """
     ensure_fresh_heartbeat()
 
+    state = get_vehicle_state()
+    initial_altitude = state.get("relative_altitude_m")
+    if initial_altitude is None:
+        state = wait_for_state(
+            lambda snapshot: snapshot["relative_altitude_m"] is not None,
+            STATE_CONFIRM_TIMEOUT,
+        )
+        initial_altitude = state["relative_altitude_m"]
+
     set_copter_mode("LAND")
 
-    print(
-        "[MAVLink] LAND mode confirmed. "
-        "Continue monitoring telemetry until landing is verified."
-    )
+    if initial_altitude > LAND_DESCENT_CONFIRMATION_METRES:
+        descended_state = wait_for_state(
+            lambda snapshot: (
+                snapshot["relative_altitude_m"] is not None
+                and snapshot["relative_altitude_m"]
+                <= initial_altitude - LAND_DESCENT_CONFIRMATION_METRES
+            ),
+            LAND_DESCENT_TIMEOUT,
+        )
+        print(
+            "[MAVLink] Landing descent confirmed: "
+            f"{initial_altitude:.1f} m -> "
+            f"{descended_state['relative_altitude_m']:.1f} m."
+        )
+        return descended_state
+
+    print("[MAVLink] LAND mode confirmed; vehicle is already near ground level.")
+    return get_vehicle_state()
 
 
 # ============================================================
@@ -948,9 +971,9 @@ def execute_command(message):
             send_command_status(
                 command_id,
                 drone_id,
-                "MODE_CONFIRMED",
-                "LAND mode confirmed. Touchdown has not yet "
-                "been verified.",
+                "STATE_CONFIRMED",
+                "LAND mode confirmed; descent was observed or the vehicle "
+                "was already near ground level.",
             )
 
     except Exception as exc:
