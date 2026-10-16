@@ -139,6 +139,52 @@ wscat -c ws://localhost:8080/ws/telemetry
 {"type":"SUBSCRIBE","droneId":"DRONE-001"}
 ```
 
+### Option C: Python MAVLink command bridge (SITL)
+
+The bridge sends flight commands to ArduPilot SITL over MAVLink and publishes
+the vehicle's live MAVLink telemetry to the backend's Kafka topic. Start local
+infrastructure and the Spring Boot backend first so Kafka and the
+`drone.telemetry` topic are available. Then, at the MAVProxy prompt connected
+to the vehicle, forward MAVLink to the computer running the bridge:
+
+```text
+output add <bridge-computer-IP>:14553
+```
+
+If SITL/MAVProxy and the bridge are on the same computer, use
+`output add 127.0.0.1:14553`. The bridge listens on `udpin:0.0.0.0:14553`;
+allow inbound UDP port `14553` through the bridge computer's firewall. If you
+change `MAVLINK_CONNECTION`, update the MAVProxy output address and port to
+match. The bridge checks Kafka and stops with a diagnostic if Kafka is
+unavailable or no vehicle heartbeat arrives within 30 seconds.
+
+In PowerShell, from the repository root, install dependencies and run the
+bridge:
+
+```powershell
+python -m pip install -r requirements.txt
+$env:DRONEIQ_HOST = "localhost"
+$env:DRONEIQ_PORT = "8081"
+$env:DRONE_ID = "DRONE-001"
+$env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+python .\websocket_python_2.py
+```
+
+The bridge itself publishes MAVLink telemetry to Kafka; do not also run
+`mavlink_to_kafka_v1.py` for the same vehicle unless you intentionally want
+duplicate telemetry records. Keep the backend's `SIMULATOR_ENABLED=false`
+when validating the SITL data so mock telemetry does not compete with the real
+vehicle state.
+
+The emergency DISARM control is relayed to the bridge as a normal MAVLink
+disarm request. The autopilot's safety checks remain enabled, and the UI only
+confirms the disarmed state after live telemetry reports it.
+
+If the seeded login is unavailable, set `DRONEIQ_USERNAME` and
+`DRONEIQ_PASSWORD` to valid backend credentials before starting the bridge.
+Keep this connected to SITL for testing; flight commands can arm and move the
+vehicle.
+
 ---
 
 ## 7. Running Tests

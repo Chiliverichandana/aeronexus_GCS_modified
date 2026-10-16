@@ -3,6 +3,7 @@ import { AlertOctagon, RotateCcw, ArrowDownCircle, Ban, PowerOff, PlaneTakeoff }
 import { useTelemetry } from "@/hooks/useTelemetry.js"
 import { useAuth } from "@/hooks/useAuth.js"
 import { Permissions } from "@/auth/permissions.js"
+import { flightControlService } from "@/services/control/flightControlService.js"
 import { apiClient } from "@/services/api/apiClient.js"
 import { ConnectionState } from "@/services/telemetry/telemetryTypes.js"
 import { logService } from "@/services/api/logService.js"
@@ -16,7 +17,7 @@ import { showAlert, AlertTypes, AlertCategories } from "@/services/notification/
  * Protects dangerous commands with mandatory centralized confirmation dialogs.
  */
 export const EmergencyOverrideDeck = () => {
-  const { selectedDroneId, telemetry, connectionState, isLive } = useTelemetry()
+  const { selectedDroneId, telemetry, connectionState, isLive, executeArmCommand } = useTelemetry()
   const { hasPermission, isAuthenticated, user } = useAuth()
   const { requestActionConfirmation } = useFlyConfirmation()
   const { currentProject } = useMission()
@@ -82,6 +83,7 @@ export const EmergencyOverrideDeck = () => {
     // Section 16 & 4: Do NOT block TAKEOFF on client because of telemetry/GPS/status
     setIsOpen(false)
     const droneId = selectedDroneId || "DRONE-001"
+    const targetAltitude = 10
 
     requestActionConfirmation({
       action: "TAKEOFF",
@@ -89,32 +91,40 @@ export const EmergencyOverrideDeck = () => {
       confirmLabel: "Confirm Takeoff",
       cancelLabel: "Cancel",
       droneId,
-      targetAltitude: "10 m",
+      targetAltitude: `${targetAltitude} m`,
       currentState: telemetry?.flightMode || "GUIDED",
       onConfirm: async () => {
         try {
-          await apiClient("/api/commands/override", {
-            method: "POST",
-            body: JSON.stringify({
-              commandType: "TAKEOFF",
-              command: "TAKEOFF",
-              droneId,
-              timestamp: new Date().toISOString(),
-            }),
+          await flightControlService.sendFlightCommand({
+            commandType: "TAKEOFF",
+            droneId,
+            parameters: { altitude: targetAltitude },
+          })
+
+          const initialAltitude =
+            telemetry?.metadata?.source === "pymavlink" &&
+            typeof telemetry.altitude === "number"
+              ? telemetry.altitude
+              : 0
+
+          await flightControlService.waitForTakeoffConfirmation({
+            droneId,
+            targetAltitude,
+            initialAltitude,
           })
 
           // Section 4 & 18: ONE final SUCCESS notification
           showAlert({
             type: AlertTypes.SUCCESS,
             title: "TAKEOFF SUCCESS",
-            message: `Takeoff initiated for ${droneId}.`,
+            message: `Climb confirmed for ${droneId}.`,
             key: "TAKEOFF_RESULT",
             category: AlertCategories.FLIGHT,
           })
 
           window.dispatchEvent(
             new CustomEvent("aeronexus:takeoff", {
-              detail: { droneId, timestamp: new Date().toISOString() },
+              detail: { droneId, targetAltitude, timestamp: new Date().toISOString() },
             })
           )
 
@@ -123,8 +133,8 @@ export const EmergencyOverrideDeck = () => {
               droneId,
               operator: user?.username || "Alex Vance",
               event: "COMMAND_TAKEOFF",
-              details: `MAV_CMD_NAV_TAKEOFF initiated for ${droneId}.`,
-              status: "Executed",
+              details: `MAV_CMD_NAV_TAKEOFF climb confirmed for ${droneId} at ${targetAltitude} m target.`,
+              status: "Confirmed",
               severity: "INFO",
               flightMode: telemetry?.flightMode || "GUIDED",
             })
@@ -194,17 +204,24 @@ export const EmergencyOverrideDeck = () => {
       currentMode: isRtl ? (telemetry?.flightMode || "GUIDED") : undefined,
       newMode: isRtl ? "RTL" : undefined,
       onConfirm: async () => {
-        const cmdMap = {
-          OVERRIDE_RTL: "OVERRIDE_RTL",
-          RTL: "OVERRIDE_RTL",
-          EMERGENCY_LAND: "EMERGENCY_LAND",
-          LAND: "EMERGENCY_LAND",
-          FORCE_DISARM: "FORCE_DISARM",
-          DISARM: "FORCE_DISARM",
-        }
-        const backendCommand = cmdMap[actionKey] || actionKey
-
         try {
+          if (isDisarm) {
+            await executeArmCommand({
+              arm: false,
+              droneId,
+              isOverride: true,
+            })
+            return
+          }
+
+          const cmdMap = {
+            OVERRIDE_RTL: "OVERRIDE_RTL",
+            RTL: "OVERRIDE_RTL",
+            EMERGENCY_LAND: "EMERGENCY_LAND",
+            LAND: "EMERGENCY_LAND",
+          }
+          const backendCommand = cmdMap[actionKey] || actionKey
+
           await apiClient("/api/commands/override", {
             method: "POST",
             body: JSON.stringify({
@@ -215,6 +232,8 @@ export const EmergencyOverrideDeck = () => {
             }),
           })
         } catch (err) {
+          if (isDisarm) return
+
           const failMsg = err?.data?.message || err?.message || "Command rejected by vehicle."
           if (isRtl) {
             showAlert({
@@ -230,14 +249,6 @@ export const EmergencyOverrideDeck = () => {
               title: "LAND FAILED",
               message: failMsg,
               key: "LAND_RESULT",
-              category: AlertCategories.FLIGHT,
-            })
-          } else if (isDisarm) {
-            showAlert({
-              type: AlertTypes.ERROR,
-              title: "DISARM FAILED",
-              message: failMsg,
-              key: "DISARM_RESULT",
               category: AlertCategories.FLIGHT,
             })
           }
@@ -262,15 +273,6 @@ export const EmergencyOverrideDeck = () => {
             category: AlertCategories.FLIGHT,
           })
           window.dispatchEvent(new CustomEvent("aeronexus:emergency-land"))
-        } else if (isDisarm) {
-          showAlert({
-            type: AlertTypes.SUCCESS,
-            title: "DISARM SUCCESS",
-            message: `Immediate motor kill command sent to ${droneId}.`,
-            key: "DISARM_RESULT",
-            category: AlertCategories.FLIGHT,
-          })
-          window.dispatchEvent(new CustomEvent("aeronexus:emergency-disarm"))
         }
       },
     })
@@ -378,9 +380,9 @@ export const EmergencyOverrideDeck = () => {
             >
               <div className="flex items-center gap-2">
                 <PowerOff className="w-3.5 h-3.5 text-[#EF4444]" />
-                <span>FORCE DISARM</span>
+                <span>EMERGENCY DISARM</span>
               </div>
-              <span className="text-[8.5px] opacity-60">KILL MOTORS</span>
+              <span className="text-[8.5px] opacity-60">SAFETY CHECKS APPLY</span>
             </button>
 
             {/* 5. ABORT MISSION */}

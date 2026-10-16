@@ -4,7 +4,6 @@
  * Centralized flight command execution and virtual joystick adapter.
  * Handles:
  * - ARM / DISARM command dispatch via authenticated REST (/api/commands/execute or /api/commands/override)
- * - WebSocket command forwarding via telemetryClient
  * - Authoritative state confirmation listener
  * - Virtual joystick manual control mapping with strict RBAC enforcement
  */
@@ -95,19 +94,6 @@ class FlightControlService {
       }
     }
 
-    // 2. Also forward via WebSocket if connected
-    try {
-      telemetryClient.send({
-        type: "COMMAND",
-        commandType,
-        command: commandType,
-        droneId,
-        timestamp: payload.timestamp,
-      })
-    } catch (wsErr) {
-      console.debug("[FlightControlService] WS command forward note:", wsErr.message)
-    }
-
     return responseData
   }
 
@@ -143,19 +129,53 @@ class FlightControlService {
       body: JSON.stringify(payload),
     })
 
-    try {
-      telemetryClient.send({
-        type: "COMMAND",
-        commandType,
-        droneId,
-        parameters,
-        timestamp: payload.timestamp,
-      })
-    } catch {
-      // Safe ignore
-    }
-
     return response
+  }
+
+  /**
+   * Wait until MAVLink telemetry confirms the vehicle has started climbing.
+   */
+  async waitForTakeoffConfirmation({
+    droneId = "DRONE-001",
+    targetAltitude = 10,
+    initialAltitude = 0,
+    timeoutMs = 60000,
+  } = {}) {
+    const climbThreshold = Math.min(1.5, targetAltitude * 0.8)
+    const expectedAltitude = initialAltitude + climbThreshold
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timeoutId
+
+      const cleanup = () => {
+        clearTimeout(timeoutId)
+        unsubscribe()
+      }
+
+      const unsubscribe = telemetryClient.onTelemetry((telemetry) => {
+        if (
+          telemetry?.droneId !== droneId ||
+          telemetry?.metadata?.source !== "pymavlink" ||
+          typeof telemetry.altitude !== "number"
+        ) {
+          return
+        }
+
+        if (telemetry.altitude >= expectedAltitude && !settled) {
+          settled = true
+          cleanup()
+          resolve(true)
+        }
+      })
+
+      timeoutId = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error(`No SITL climb confirmation received for ${droneId}.`))
+      }, timeoutMs)
+    })
   }
 
   /**

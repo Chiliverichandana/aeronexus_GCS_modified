@@ -472,40 +472,24 @@ export const TelemetryProvider = ({ children }) => {
       handleFlightModeChange("BRAKE", "EMERGENCY_OVERRIDE")
     }
 
-    const handleDisarm = () => {
-      updateArmedState(false, {
-        source: "EMERGENCY_OVERRIDE",
-        commandId: `EMERGENCY-DISARM-${Date.now()}`,
-        userAction: "EMERGENCY_DISARM",
-        backendResponse: { success: true },
-        isConfirmed: true,
-      })
-    }
-
     window.addEventListener("aeronexus:toast", handleToastEvent)
     window.addEventListener("aeronexus:emergency-rtl", handleRtl)
     window.addEventListener("aeronexus:emergency-land", handleLand)
     window.addEventListener("aeronexus:emergency-abort", handleAbort)
-    window.addEventListener("aeronexus:emergency-disarm", handleDisarm)
 
     return () => {
       window.removeEventListener("aeronexus:toast", handleToastEvent)
       window.removeEventListener("aeronexus:emergency-rtl", handleRtl)
       window.removeEventListener("aeronexus:emergency-land", handleLand)
       window.removeEventListener("aeronexus:emergency-abort", handleAbort)
-      window.removeEventListener("aeronexus:emergency-disarm", handleDisarm)
     }
-  }, [showToast, handleFlightModeChange, selectedDroneId, updateArmedState])
+  }, [showToast, handleFlightModeChange])
 
   /**
    * Execute real ARM or DISARM flight command through backend and wait for authoritative state
    */
   const executeArmCommand = useCallback(async ({ arm = true, droneId, isOverride = false } = {}) => {
     const targetDroneId = droneId || selectedDroneId || "DRONE-001"
-    const reportedArmed = fleetTelemetry[targetDroneId]?.armed
-    const currentVehicleArmed = targetDroneId === selectedDroneId && isLive && typeof reportedArmed === "boolean"
-      ? reportedArmed
-      : isArmed
     const actionLabel = arm ? "ARM" : "DISARM"
     const userAction = arm ? "USER_ARM_CONFIRMED" : "USER_DISARM_CONFIRMED"
     const commandId = `CMD-${actionLabel}-${Date.now()}`
@@ -548,14 +532,6 @@ export const TelemetryProvider = ({ children }) => {
 
     // Section 16 & 2 & 3: Do NOT block ARM/DISARM on client because of connection state, stale telemetry, or GPS.
     // Send command directly to vehicle/backend and let actual response determine result.
-
-    // If drone is already in requested state, no-op
-    if (arm && currentVehicleArmed) {
-      return true
-    }
-    if (!arm && !currentVehicleArmed) {
-      return true
-    }
 
     // Send Command
     console.info(`[ARM] Sending command: ${actionLabel} for ${targetDroneId}`)
@@ -646,7 +622,7 @@ export const TelemetryProvider = ({ children }) => {
     })
 
     return true
-  }, [selectedDroneId, isAuthenticated, isArmed, isLive, fleetTelemetry, updateArmedState])
+  }, [selectedDroneId, isAuthenticated, updateArmedState])
 
   const toggleArmed = useCallback(async (source = "USER") => {
     try {

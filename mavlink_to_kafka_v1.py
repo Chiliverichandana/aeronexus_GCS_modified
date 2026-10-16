@@ -10,7 +10,8 @@ from pymavlink import mavutil
 DRONE_ID = "DRONE-001"
 
 # MAVLink connection
-MAVLINK_CONNECTION = "udp:127.0.0.1:14551"
+MAVLINK_CONNECTION = "udpin:0.0.0.0:14554"
+
 # MAVLINK_CONNECTION = "/dev/ttyUSB0"
 # MAVLINK_CONNECTION = "serial:/dev/ttyUSB0:57600"
 

@@ -99,17 +99,31 @@ public class FlightCommandService {
 
         @Transactional
     public FlightCommandResponse executeOverrideCommand(FlightCommandRequest request, String managerUsername) {
-        FlightCommand command = new FlightCommand(
-                request.droneId(),
-                request.commandType().toUpperCase(),
-                true,
-                managerUsername,
-                "OVERRIDE_EXECUTED",
-                request.getEffectivePayloadJson()
-        );
-        FlightCommand saved = commandRepository.save(command);
-        return FlightCommandResponse.fromEntity(saved);
-    }
+            String commandType = request.commandType().toUpperCase();
+            boolean disarmRequest = "FORCE_DISARM".equals(commandType)
+                    || "DISARM".equals(commandType);
+
+            FlightCommand command = new FlightCommand(
+                    request.droneId(),
+                    commandType,
+                    true,
+                    managerUsername,
+                    disarmRequest ? "OVERRIDE_PENDING" : "OVERRIDE_EXECUTED",
+                    request.getEffectivePayloadJson()
+            );
+            FlightCommand saved = commandRepository.save(command);
+
+            if (disarmRequest) {
+                droneCommandWebSocketService.sendCommand(
+                        request.droneId(),
+                        String.valueOf(saved.getId()),
+                        "DISARM",
+                        parseParameters(request.getEffectivePayloadJson())
+                );
+            }
+
+            return FlightCommandResponse.fromEntity(saved);
+        }
 
     @Transactional(readOnly = true)
     public List<FlightCommandResponse> getCommandHistory(String droneId) {
@@ -121,5 +135,4 @@ public class FlightCommandService {
                 .toList();
     }
 }
-
 

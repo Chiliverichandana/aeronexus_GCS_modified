@@ -103,9 +103,14 @@ export async function apiClient(endpoint, options = {}) {
     headers["Authorization"] = `Bearer ${token}`
   }
 
+  const controller = new AbortController()
+  const timeoutMs = options.timeout || 15000
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
   const config = {
     ...options,
     headers,
+    signal: options.signal || controller.signal,
   }
 
   let response
@@ -116,6 +121,8 @@ export async function apiClient(endpoint, options = {}) {
     error.isNetworkError = true
     error.status = 0
     throw error
+  } finally {
+    clearTimeout(timeoutId)
   }
 
   // Check if this request is an auth endpoint (login, register)

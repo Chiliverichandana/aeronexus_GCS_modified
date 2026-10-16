@@ -1,11 +1,14 @@
 import json
+import math
 import os
 import queue
 import threading
 import time
+from datetime import datetime, timezone
 
 from collections import deque
 
+from kafka import KafkaProducer
 import requests
 import websocket
 
@@ -31,20 +34,33 @@ PASSWORD = os.getenv("DRONEIQ_PASSWORD", "admin123")
 DRONE_ID = os.getenv("DRONE_ID", "DRONE-001")
 
 # Configure MAVProxy to forward this vehicle's MAVLink packets
-# to UDP port 14560.
+# to UDP port 14555.
 MAVLINK_CONNECTION = os.getenv(
     "MAVLINK_CONNECTION",
-    "udpin:0.0.0.0:14553",
+    "udpin:0.0.0.0:14555",
+)
+
+# Publish the simulator's actual MAVLink state to the backend's Kafka topic.
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "localhost:9092",
+)
+KAFKA_TELEMETRY_TOPIC = os.getenv(
+    "KAFKA_TOPIC_TELEMETRY",
+    "drone.telemetry",
 )
 
 # Timeouts
 HEARTBEAT_TIMEOUT = 30
 COMMAND_ACK_TIMEOUT = 8
 STATE_CONFIRM_TIMEOUT = 10
+TELEMETRY_PUBLISH_INTERVAL = 1.0
 
 # Keep example takeoff requests within a conservative test range.
 MIN_TAKEOFF_ALTITUDE = 1.0
 MAX_TAKEOFF_ALTITUDE = 20.0
+TAKEOFF_CLIMB_CONFIRMATION_METRES = 1.5
+TAKEOFF_CLIMB_TIMEOUT = 30
 
 
 # ============================================================
@@ -53,6 +69,8 @@ MAX_TAKEOFF_ALTITUDE = 20.0
 
 JWT_TOKEN = None
 ws_app = None
+kafka_producer = None
+kafka_publish_confirmed = threading.Event()
 
 mav = None
 
@@ -70,6 +88,17 @@ vehicle_state = {
     "custom_mode": None,
     "relative_altitude_m": None,
     "last_heartbeat": None,
+    "latitude": None,
+    "longitude": None,
+    "altitude": None,
+    "heading": 0.0,
+    "speed": 0.0,
+    "roll": 0.0,
+    "pitch": 0.0,
+    "yaw": 0.0,
+    "battery_percentage": 0.0,
+    "gps_satellites": 0,
+    "flight_mode": "UNKNOWN",
 }
 
 # A single MAVLink reader distributes ACKs and telemetry state.
@@ -128,6 +157,103 @@ def login():
     print("JWT received successfully. Token not displayed.")
 
     return token
+
+
+# ============================================================
+# KAFKA TELEMETRY
+# ============================================================
+
+def connect_to_kafka():
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        key_serializer=lambda value: value.encode("utf-8"),
+        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        max_block_ms=5000,
+        request_timeout_ms=5000,
+        retries=3,
+    )
+
+    try:
+        partitions = producer.partitions_for(KAFKA_TELEMETRY_TOPIC)
+        if not partitions:
+            raise RuntimeError(
+                f"Kafka topic {KAFKA_TELEMETRY_TOPIC!r} is unavailable."
+            )
+    except Exception as exc:
+        producer.close(timeout=5)
+        raise RuntimeError(
+            f"Cannot connect to Kafka at {KAFKA_BOOTSTRAP_SERVERS} "
+            f"or access topic {KAFKA_TELEMETRY_TOPIC!r}: {exc}"
+        ) from exc
+
+    print(
+        f"Kafka connected: {KAFKA_BOOTSTRAP_SERVERS}, "
+        f"topic={KAFKA_TELEMETRY_TOPIC}"
+    )
+    return producer
+
+
+def telemetry_publisher():
+    while True:
+        time.sleep(TELEMETRY_PUBLISH_INTERVAL)
+
+        with state_condition:
+            snapshot = dict(vehicle_state)
+
+        last_heartbeat = snapshot["last_heartbeat"]
+        if (
+            snapshot["latitude"] is None
+            or snapshot["longitude"] is None
+            or last_heartbeat is None
+            or time.monotonic() - last_heartbeat > 3
+        ):
+            continue
+
+        payload = {
+            "droneId": DRONE_ID,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "latitude": snapshot["latitude"],
+            "longitude": snapshot["longitude"],
+            "altitude": snapshot["altitude"],
+            "heading": snapshot["heading"],
+            "speed": snapshot["speed"],
+            "roll": snapshot["roll"],
+            "pitch": snapshot["pitch"],
+            "yaw": snapshot["yaw"],
+            "batteryPercentage": snapshot["battery_percentage"],
+            "gpsSatellites": snapshot["gps_satellites"],
+            "flightMode": snapshot["flight_mode"],
+            "armed": snapshot["armed"],
+            "status": "OK",
+            "metadata": {
+                "source": "pymavlink",
+                "systemId": mav.target_system,
+                "componentId": mav.target_component,
+            },
+        }
+
+        try:
+            future = kafka_producer.send(
+                KAFKA_TELEMETRY_TOPIC,
+                key=DRONE_ID,
+                value=payload,
+            )
+            future.add_callback(report_first_kafka_publish)
+            future.add_errback(
+                lambda exc: print("[Kafka] Telemetry publish failed:", exc)
+            )
+        except Exception as exc:
+            print("[Kafka] Telemetry publish failed:", exc)
+
+
+def report_first_kafka_publish(record_metadata):
+    if not kafka_publish_confirmed.is_set():
+        kafka_publish_confirmed.set()
+        print(
+            f"[Kafka] First telemetry record confirmed: "
+            f"{record_metadata.topic} partition={record_metadata.partition} "
+            f"offset={record_metadata.offset}"
+        )
 
 
 # ============================================================
@@ -215,8 +341,13 @@ def connect_to_sitl():
 
     if heartbeat is None:
         raise TimeoutError(
-            "No MAVLink heartbeat received. "
-            "Check SITL, MAVProxy output, and UDP port."
+            f"No MAVLink heartbeat received within {HEARTBEAT_TIMEOUT}s "
+            f"on {MAVLINK_CONNECTION}. Confirm SITL is running and, at the "
+            "MAVProxy prompt connected to that vehicle, run "
+            "`output add <bridge-computer-IP>:14553` (use "
+            "`127.0.0.1` only when the bridge is on the same computer). "
+            "The MAVProxy output port must match this bridge's "
+            "MAVLINK_CONNECTION."
         )
 
     if heartbeat.type == mavutil.mavlink.MAV_TYPE_GCS:
@@ -278,19 +409,17 @@ def mavlink_reader():
             if message_type == "BAD_DATA":
                 continue
 
+            if (
+                mav.target_system
+                and message.get_srcSystem() != mav.target_system
+            ):
+                continue
+
             # ------------------------------------------------
             # Heartbeat: armed state and flight mode
             # ------------------------------------------------
 
             if message_type == "HEARTBEAT":
-
-                # Ignore other systems if the UDP endpoint carries
-                # traffic from more than one MAVLink system.
-                if (
-                    mav.target_system
-                    and message.get_srcSystem() != mav.target_system
-                ):
-                    continue
 
                 with state_condition:
                     vehicle_state["heartbeat_received"] = True
@@ -302,6 +431,9 @@ def mavlink_reader():
 
                     vehicle_state["custom_mode"] = message.custom_mode
                     vehicle_state["last_heartbeat"] = time.monotonic()
+                    vehicle_state["flight_mode"] = (
+                        mav.flightmode or "UNKNOWN"
+                    )
 
                     state_condition.notify_all()
 
@@ -311,20 +443,46 @@ def mavlink_reader():
 
             elif message_type == "GLOBAL_POSITION_INT":
 
-                if (
-                    mav.target_system
-                    and message.get_srcSystem() != mav.target_system
-                ):
-                    continue
-
                 relative_altitude_m = message.relative_alt / 1000.0
 
                 with state_condition:
                     vehicle_state["relative_altitude_m"] = (
                         relative_altitude_m
                     )
+                    vehicle_state["latitude"] = message.lat / 10_000_000.0
+                    vehicle_state["longitude"] = message.lon / 10_000_000.0
+                    vehicle_state["altitude"] = max(0.0, relative_altitude_m)
+                    vehicle_state["speed"] = (
+                        (message.vx / 100.0) ** 2
+                        + (message.vy / 100.0) ** 2
+                    ) ** 0.5
+                    if message.hdg != 65535:
+                        vehicle_state["heading"] = message.hdg / 100.0
 
                     state_condition.notify_all()
+
+            elif message_type == "ATTITUDE":
+                with state_condition:
+                    vehicle_state["roll"] = math.degrees(message.roll)
+                    vehicle_state["pitch"] = math.degrees(message.pitch)
+                    vehicle_state["yaw"] = (
+                        math.degrees(message.yaw) % 360.0
+                    )
+
+            elif message_type in {"BATTERY_STATUS", "SYS_STATUS"}:
+                battery_percentage = message.battery_remaining
+                if battery_percentage >= 0:
+                    with state_condition:
+                        vehicle_state["battery_percentage"] = float(
+                            battery_percentage
+                        )
+
+            elif message_type == "GPS_RAW_INT":
+                if message.satellites_visible != 255:
+                    with state_condition:
+                        vehicle_state["gps_satellites"] = int(
+                            message.satellites_visible
+                        )
 
             # ------------------------------------------------
             # Command ACK: deliver to matching waiter
@@ -596,6 +754,16 @@ def takeoff(altitude):
     if not is_armed():
         arm_or_disarm(True)
 
+    state = wait_for_state(
+        lambda snapshot: snapshot["relative_altitude_m"] is not None,
+        STATE_CONFIRM_TIMEOUT,
+    )
+    initial_altitude = state["relative_altitude_m"]
+    climb_threshold = min(
+        TAKEOFF_CLIMB_CONFIRMATION_METRES,
+        altitude * 0.8,
+    )
+
     print(f"[MAVLink] Requesting takeoff to {altitude} metres")
 
     command_id = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
@@ -611,9 +779,18 @@ def takeoff(altitude):
         param7=altitude,
     )
 
+    confirmed_state = wait_for_state(
+        lambda snapshot: (
+            snapshot["relative_altitude_m"] is not None
+            and snapshot["relative_altitude_m"]
+            >= initial_altitude + climb_threshold
+        ),
+        TAKEOFF_CLIMB_TIMEOUT,
+    )
     print(
-        "[MAVLink] Takeoff command acknowledged. "
-        "Continue monitoring altitude to verify completion."
+        "[MAVLink] Takeoff climb confirmed at "
+        f"{confirmed_state['relative_altitude_m']:.1f} metres "
+        f"(target {altitude:.1f} metres)."
     )
 
 
@@ -761,9 +938,8 @@ def execute_command(message):
             send_command_status(
                 command_id,
                 drone_id,
-                "ACCEPTED",
-                "Autopilot acknowledged takeoff request. "
-                "Target altitude has not yet been verified.",
+                "STATE_CONFIRMED",
+                "MAVLink telemetry confirmed takeoff climb.",
             )
 
         elif command_type == "LAND":
@@ -872,6 +1048,13 @@ def on_message(ws, message):
                 f"[WebSocket] WARNING: Registered drone ID "
                 f"does not match configured ID: {registered_drone_id}"
             )
+    elif message_type in {"AUTH_FAILURE", "AUTH_REQUIRED"}:
+        authenticated.clear()
+        print(
+            "[WebSocket] Authentication failed:",
+            data.get("message", message_type),
+        )
+
     elif message_type == "COMMAND":
         if not authenticated.is_set():
             print(
@@ -956,29 +1139,39 @@ def keepalive_worker():
 # ============================================================
 
 def main():
-    global JWT_TOKEN, ws_app
+    global JWT_TOKEN, ws_app, kafka_producer
 
-    # 1. Authenticate with Spring Boot.
+    # 1. Confirm Kafka is available before accepting flight commands.
+    kafka_producer = connect_to_kafka()
+
+    # 2. Authenticate with Spring Boot.
     JWT_TOKEN = login()
 
-    # 2. Connect to ArduPilot SITL.
+    # 3. Connect to ArduPilot SITL.
     connect_to_sitl()
 
-    # 3. Start the serialized command worker.
+    # 4. Start the serialized command worker.
     threading.Thread(
         target=command_worker,
         daemon=True,
         name="command-worker",
     ).start()
 
-    # 4. Start WebSocket keepalive.
+    # 5. Publish actual vehicle telemetry to Kafka.
+    threading.Thread(
+        target=telemetry_publisher,
+        daemon=True,
+        name="telemetry-publisher",
+    ).start()
+
+    # 6. Start WebSocket keepalive.
     threading.Thread(
         target=keepalive_worker,
         daemon=True,
         name="websocket-keepalive",
     ).start()
 
-    # 5. Connect the WebSocket client.
+    # 7. Connect the WebSocket client.
     ws_app = websocket.WebSocketApp(
         WS_URL,
         on_open=on_open,
@@ -992,6 +1185,7 @@ def main():
     print("Drone ID:", DRONE_ID)
     print("WebSocket:", WS_URL)
     print("MAVLink:", MAVLINK_CONNECTION)
+    print("Kafka:", KAFKA_BOOTSTRAP_SERVERS, KAFKA_TELEMETRY_TOPIC)
     print()
 
     # Automatic reconnection can be added after ensuring that
@@ -1008,3 +1202,10 @@ if __name__ == "__main__":
 
     except Exception as exc:
         print("\nBridge startup failed:", exc)
+        raise SystemExit(1) from exc
+    finally:
+        if kafka_producer is not None:
+            try:
+                kafka_producer.close(timeout=5)
+            except Exception as exc:
+                print("[Kafka] Producer shutdown failed:", exc)

@@ -1,0 +1,4 @@
+pymavlink
+requests
+websocket-client
+kafka-python
